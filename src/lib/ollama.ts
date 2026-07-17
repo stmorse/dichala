@@ -50,6 +50,26 @@ export async function streamChat(
   }
 }
 
+// One-shot (non-streaming) chat completion. Used for small utility calls like
+// generating side-chat title summaries.
+export async function chatOnce(
+  baseUrl: string,
+  model: string,
+  messages: ChatMessage[],
+): Promise<string> {
+  const res = await fetch(`${baseUrl}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, messages, stream: false }),
+  })
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '')
+    throw new Error(`Ollama request failed (${res.status}). ${detail}`)
+  }
+  const data = (await res.json()) as { message?: { content?: string } }
+  return data.message?.content ?? ''
+}
+
 // Lists locally available model names from an Ollama server.
 export async function listModels(baseUrl: string): Promise<string[]> {
   const res = await fetch(`${baseUrl}/api/tags`)

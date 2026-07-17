@@ -19,6 +19,39 @@ export function focusText(conv: Conversation, sc: SideChat): string {
   return blocks[sc.blockIndex] ?? ''
 }
 
+// Prompt for the 2-3 word side-chat label, generated after the first exchange.
+export function buildSummaryMessages(
+  focus: string,
+  question: string,
+): ChatMessage[] {
+  return [
+    {
+      role: 'system',
+      content:
+        'You generate ultra-short labels. Reply with ONLY a 2-3 word label ' +
+        'for the discussion topic. No quotes, no punctuation, no explanation.',
+    },
+    {
+      role: 'user',
+      content:
+        `Excerpt under discussion:\n${focus}\n\nQuestion about it:\n${question}\n\n` +
+        'Give a 2-3 word label for this discussion.',
+    },
+  ]
+}
+
+// Normalizes a model-generated label: strips quotes/punctuation wrappers,
+// clamps to a few words so it fits an icon tooltip and panel title.
+export function cleanSummary(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^["'`\s]+|["'`.!\s]+$/g, '')
+    .split(/\s+/)
+    .slice(0, 4)
+    .join(' ')
+    .slice(0, 40)
+}
+
 export function buildSideChatMessages(
   conv: Conversation,
   sc: SideChat,

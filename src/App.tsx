@@ -16,8 +16,13 @@ import type {
 } from './lib/types'
 import { pathToLeaf } from './lib/tree'
 import { splitTopLevelBlocks } from './lib/blocks'
-import { buildSideChatMessages, focusText } from './lib/sidechat'
-import { streamChat, listModels } from './lib/ollama'
+import {
+  buildSideChatMessages,
+  buildSummaryMessages,
+  cleanSummary,
+  focusText,
+} from './lib/sidechat'
+import { streamChat, chatOnce, listModels } from './lib/ollama'
 import {
   loadConversations,
   saveConversations,
@@ -259,16 +264,7 @@ export default function App() {
 
   function handleCreateSideChat(nodeId: string, blockIndex: number) {
     if (!current) return
-    // Reuse an existing side-chat for this exact block rather than piling up.
-    const existing = Object.values(current.sideChats ?? {}).find(
-      (s) => s.anchorNodeId === nodeId && s.blockIndex === blockIndex,
-    )
-    if (existing) {
-      setOpenSideChatIds((ids) =>
-        ids.includes(existing.id) ? ids : [...ids, existing.id],
-      )
-      return
-    }
+    // A block can host any number of side-chats; each + click makes a new one.
     const sc: SideChat = {
       id: crypto.randomUUID(),
       anchorNodeId: nodeId,
@@ -286,6 +282,10 @@ export default function App() {
       }
     })
     setOpenSideChatIds((ids) => [...ids, sc.id])
+  }
+
+  function handleOpenSideChat(id: string) {
+    setOpenSideChatIds((ids) => (ids.includes(id) ? ids : [...ids, id]))
   }
 
   function handleCloseSideChat(id: string) {
@@ -356,6 +356,8 @@ export default function App() {
         }
       })
 
+    const isFirstMessage = sc.messages.length === 0
+
     try {
       await streamChat(
         settings.baseUrl,
@@ -371,6 +373,36 @@ export default function App() {
     } finally {
       setSideChatStreamingId(null)
       sideAbortRef.current = null
+    }
+
+    // After the first exchange, generate the 2-3 word label shown as the
+    // panel title and the icon tooltip. Runs after the reply stream so it
+    // doesn't compete with it for the model; failures just leave it blank.
+    if (isFirstMessage && !sc.summary) {
+      try {
+        const raw = await chatOnce(
+          settings.baseUrl,
+          settings.model,
+          buildSummaryMessages(focusText(nextConv, nextSc), userMsg.content),
+        )
+        const summary = cleanSummary(raw)
+        if (summary) {
+          setConversations((prev) => {
+            const c = prev[conv.id]
+            const s = c?.sideChats?.[sideChatId]
+            if (!c || !s) return prev
+            return {
+              ...prev,
+              [c.id]: {
+                ...c,
+                sideChats: { ...c.sideChats, [sideChatId]: { ...s, summary } },
+              },
+            }
+          })
+        }
+      } catch {
+        // Non-fatal: the side-chat just keeps a blank title.
+      }
     }
   }
 
@@ -402,7 +434,8 @@ export default function App() {
                 node={m}
                 isStreaming={m.id === streamingNodeId}
                 sideChats={current?.sideChats}
-                onBranch={handleCreateSideChat}
+                onCreate={handleCreateSideChat}
+                onOpen={handleOpenSideChat}
                 registerBlock={registerBlock}
               />
             ))}
@@ -486,10 +519,11 @@ function MessageBubble(props: {
   node: MessageNode
   isStreaming: boolean
   sideChats: Record<string, SideChat> | undefined
-  onBranch: (nodeId: string, blockIndex: number) => void
+  onCreate: (nodeId: string, blockIndex: number) => void
+  onOpen: (sideChatId: string) => void
   registerBlock: (key: string, el: HTMLElement | null) => void
 }) {
-  const { node, isStreaming, sideChats, onBranch, registerBlock } = props
+  const { node, isStreaming, sideChats, onCreate, onOpen, registerBlock } = props
 
   // User messages: keep as plain text. Assistant messages: render markdown.
   // While streaming, render as one markdown block (no branch affordances yet);
@@ -514,19 +548,20 @@ function MessageBubble(props: {
     body = (
       <div className="content">
         {blocks.map((block, i) => {
-          const hasSideChat = sideChats
-            ? Object.values(sideChats).some(
-                (s) => s.anchorNodeId === node.id && s.blockIndex === i,
-              )
-            : false
+          const blockChats = sideChats
+            ? Object.values(sideChats)
+                .filter((s) => s.anchorNodeId === node.id && s.blockIndex === i)
+                .sort((a, b) => a.createdAt - b.createdAt)
+            : []
           return (
             <MarkdownBlock
               key={i}
               nodeId={node.id}
               blockIndex={i}
               markdown={block}
-              hasSideChat={hasSideChat}
-              onBranch={onBranch}
+              sideChats={blockChats}
+              onCreate={onCreate}
+              onOpen={onOpen}
               registerBlock={registerBlock}
             />
           )
@@ -547,26 +582,41 @@ function MarkdownBlock(props: {
   nodeId: string
   blockIndex: number
   markdown: string
-  hasSideChat: boolean
-  onBranch: (nodeId: string, blockIndex: number) => void
+  sideChats: SideChat[]
+  onCreate: (nodeId: string, blockIndex: number) => void
+  onOpen: (sideChatId: string) => void
   registerBlock: (key: string, el: HTMLElement | null) => void
 }) {
-  const { nodeId, blockIndex, markdown, hasSideChat, onBranch, registerBlock } =
+  const { nodeId, blockIndex, markdown, sideChats, onCreate, onOpen, registerBlock } =
     props
   const key = `${nodeId}:${blockIndex}`
   return (
     <div
-      className={'md-block' + (hasSideChat ? ' branched' : '')}
+      className={'md-block' + (sideChats.length > 0 ? ' branched' : '')}
       ref={(el) => registerBlock(key, el)}
     >
       <ReactMarkdown remarkPlugins={[remarkGfm]}>{markdown}</ReactMarkdown>
-      <button
-        className={'branch-btn' + (hasSideChat ? ' active' : '')}
-        title={hasSideChat ? 'Open side-chat' : 'Branch a side-chat about this'}
-        onClick={() => onBranch(nodeId, blockIndex)}
-      >
-        {hasSideChat ? '❈' : '⑃'}
-      </button>
+      {/* Vertical stack of side-chat icons; the + (new side-chat) is always
+          at the bottom. Existing icons stay visible; + appears on hover. */}
+      <div className="branch-stack">
+        {sideChats.map((sc) => (
+          <button
+            key={sc.id}
+            className="branch-icon"
+            data-tip={sc.summary || 'side-chat'}
+            onClick={() => onOpen(sc.id)}
+          >
+            ❈
+          </button>
+        ))}
+        <button
+          className="branch-plus"
+          data-tip="new side-chat"
+          onClick={() => onCreate(nodeId, blockIndex)}
+        >
+          +
+        </button>
+      </div>
     </div>
   )
 }
@@ -590,8 +640,10 @@ function SideChatPanel(props: {
       ref={(el) => registerPanel(sideChat.id, el)}
     >
       <div className="side-chat-header">
+        {/* Title is the LLM-generated 2-3 word summary; blank until the first
+            exchange. The focused excerpt is available as a tooltip. */}
         <span className="side-chat-focus" title={focus}>
-          ⑃ {focus.replace(/\s+/g, ' ').slice(0, 60) || 'side-chat'}
+          ❈ {sideChat.summary ?? ''}
         </span>
         <button
           className="side-chat-close"

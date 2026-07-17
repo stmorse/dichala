@@ -31,6 +31,7 @@ export interface SideChat {
   id: string
   anchorNodeId: string // which assistant message this hangs off
   blockIndex: number // which top-level block of that message is the focus
+  summary?: string // LLM-generated 2-3 word label; blank until first exchange
   messages: SideChatMessage[]
   createdAt: number
   updatedAt: number
